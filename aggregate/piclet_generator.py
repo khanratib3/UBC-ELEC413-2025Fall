@@ -32,6 +32,7 @@ import siepic_ebeam_pdk as pdk
 from SiEPIC.utils import create_cell2
 
 # Configuration
+process_num_submissions = 2
 layout_name = "ELEC413-PIClet-3x3"
 die_width = 2753330
 die_height = 2753340
@@ -329,24 +330,34 @@ def create_simplified_piclet(topcell, submission_cell, submission_name, filename
         make_pin(port_cell, 'opt_laser', [pin_x, pin_y], 800, 'PinRec', 180, debug=False)
         print(f"Added pin to port cell '{port_cell.name}' at left edge, middle vertically [{pin_x}, {pin_y}]")
         
-        # Create Y-branch between heater and student design
+        # Create Y-branch tree with depth 2
         from SiEPIC.utils import create_cell2
         cell_y_branch = create_cell2(ly, 'ebeam_YBranch_te1310', 'EBeam-SiN')
         if not cell_y_branch:
             raise Exception('Cannot load Y-branch cell')
         
-        # Connect heater to Y-branch input
-        from SiEPIC.scripts import connect_cell
-        y_branch_inst = connect_cell(inst_heater, 'opt2', cell_y_branch, 'opt1')
+        # Create Y-branch tree with depth 2
+        from SiEPIC.utils.layout import y_splitter_tree
+        tree_depth = 2
+        inst_tree_in, inst_tree_out, cell_tree = y_splitter_tree(cell, tree_depth=tree_depth, y_splitter_cell=cell_y_branch, library="EBeam-SiN", wg_type=wg_type, draw_waveguides=True)
         
-        # Position student design: right 2*radius*1e3, up 250 µm from Y-branch
-        student_x = y_branch_inst.bbox().right + 2 * radius * 1e3
-        student_y = y_branch_inst.bbox().center().y + 250e3  # 250 µm up
+        # Position the tree after the heater
+        tree_x = inst_heater.bbox().right
+        tree_y = inst_heater.pinPoint('opt2').y
+        t = pya.Trans(pya.Trans.R0, tree_x, tree_y)
+        tree_inst = cell.insert(pya.CellInstArray(cell_tree.cell_index(), t))
+        
+        # Connect heater to tree input
+        connect_pins_with_waveguide(inst_heater, 'opt2', inst_tree_in, 'opt_1', waveguide_type=wg_type)
+        
+        # Position student design: right 2*radius*1e3, up 250 µm from tree
+        student_x = tree_inst.bbox().right + 2 * radius * 1e3
+        student_y = tree_inst.bbox().center().y + 250e3  # 250 µm up
         submission_inst = cell.insert(pya.CellInstArray(submission_cell_new.cell_index(), 
                                                        pya.Trans(pya.Trans.R0, student_x, student_y)))
         
-        # Connect Y-branch output to student design
-        connect_pins_with_waveguide(y_branch_inst, 'opt2', submission_inst, 'opt_laser',
+        # Connect first tree output (opt2) to student design
+        connect_pins_with_waveguide(inst_tree_out[1], 'opt2', submission_inst, 'opt_laser',
                                    waveguide_type=wg_type)
         
         # Create a copy of the student design
@@ -450,34 +461,63 @@ def create_simplified_piclet(topcell, submission_cell, submission_name, filename
         else:
             print("Warning: Could not find port_SiN in copy for pin creation")
         
-        # Position the copy to the right of the original
-        # Move the copy to the right by the width of the original design plus some spacing
-        copy_x = student_x + submission_cell_new.bbox().width() + 100e3  # 100 µm spacing
-        
-        # Position the copy at the same y-level as the original
-        copy_y = student_y
-        
-        # Ensure copy stays within chip area (right edge constraint)
-        if copy_x + subcell_copy.bbox().width() > die_width/2:
-            copy_x = die_width/2 - subcell_copy.bbox().width() - 100e3  # 100 µm from right edge
-            print(f"Adjusted copy x-position to stay within chip area: {copy_x}")
-        
-        # Position and connect the copy using the same logic as the original
-        # Position copy: right 2*radius*1e3, down 250 µm from Y-branch (instead of up like original)
+        # Position copy: right 2*radius, down 250 µm from tree (instead of up like original)
         radius = 50e3  # 50 µm radius
-        copy_x = y_branch_inst.bbox().right + 2 * radius   # Same x-position as original
-        copy_y = y_branch_inst.bbox().center().y - 250e3  # 250 µm down (instead of up)
+        copy_x = tree_inst.bbox().right + 2 * radius   # Same x-position as original
+        copy_y = tree_inst.bbox().center().y - 250e3  # 250 µm down (instead of up)
         
         # Update the copy instance position
         subcell_inst.trans = pya.Trans(pya.Trans.R0, copy_x, copy_y)
         
-        # Connect Y-branch output (opt3) to student design copy
-        connect_pins_with_waveguide(y_branch_inst, 'opt3', subcell_inst, 'opt_laser',
+        # Find the absolute position of the FaML cell and align it with chip edge
+        if cell_faml:
+            # Function to find FaML positions in the layout by traversing the hierarchy
+            def find_faml_positions(cell, parent_transform=pya.Trans()):
+                faml_positions = []
+                for inst in cell.each_inst():
+                    inst_cell = ly.cell(inst.cell_index)
+                    # Check if this instance is a FaML cell
+                    if inst_cell.name == cell_faml.name:
+                        # Calculate absolute position including all transformations
+                        absolute_trans = parent_transform * inst.trans
+                        faml_positions.append(absolute_trans.disp.x)
+                        print(f"Found FaML instance at absolute x={absolute_trans.disp.x}")
+                    else:
+                        # Recursively check sub-cells
+                        sub_transform = parent_transform * inst.trans
+                        sub_faml_positions = find_faml_positions(inst_cell, sub_transform)
+                        faml_positions.extend(sub_faml_positions)
+                return faml_positions
+            
+            # Find all FaML positions in the copy
+            faml_positions = find_faml_positions(subcell_copy, pya.Trans())
+            
+            if faml_positions:
+                # Get the rightmost FaML position
+                rightmost_faml_x = max(faml_positions)
+                
+                # Calculate how much to move the copy to align rightmost FaML with chip edge
+                chip_right_edge = die_width/2
+                faml_to_edge_offset = chip_right_edge - rightmost_faml_x
+                
+                # Move the entire copy by this offset
+                new_copy_x = faml_to_edge_offset
+                subcell_inst.trans = pya.Trans(pya.Trans.R0, new_copy_x, copy_y)
+                
+                print(f"Found rightmost FaML at absolute x={rightmost_faml_x}")
+                print(f"Chip right edge at x={chip_right_edge}")
+                print(f"Moving copy by {faml_to_edge_offset} to align FaML with chip edge")
+                print(f"Copy repositioned from x={copy_x} to x={new_copy_x}")
+            else:
+                print("No FaML cells found in copy")
+        
+        # Connect second tree output (opt3) to student design copy
+        connect_pins_with_waveguide(inst_tree_out[1], 'opt3', subcell_inst, 'opt_laser',
                                    waveguide_type=wg_type)
         
-        print(f"Positioned student design copy at x={copy_x}, y={copy_y}")
-        print(f"Copy positioned down 250 µm from Y-branch")
-        print(f"Connected Y-branch opt3 to student copy")
+        print(f"Positioned student design copy at x={subcell_inst.trans.disp.x}, y={copy_y}")
+        print(f"Copy positioned down 250 µm from tree")
+        print(f"Connected tree output 2 to student copy")
         
     else:
         print(f"No port_SiN found in submission {submission_name}, using fallback connection")
@@ -485,24 +525,34 @@ def create_simplified_piclet(topcell, submission_cell, submission_name, filename
         from SiEPIC.utils.layout import make_pin
         make_pin(submission_cell_new, 'opt_laser', [submission_bbox.width()//2, 0], 800, 'PinRec', 0)
         
-        # Create Y-branch between heater and student design
+        # Create Y-branch tree with depth 2
         from SiEPIC.utils import create_cell2
         cell_y_branch = create_cell2(ly, 'ebeam_YBranch_te1310', 'EBeam-SiN')
         if not cell_y_branch:
             raise Exception('Cannot load Y-branch cell')
         
-        # Connect heater to Y-branch input
-        from SiEPIC.scripts import connect_cell
-        y_branch_inst = connect_cell(inst_heater, 'opt2', cell_y_branch, 'opt1')
+        # Create Y-branch tree with depth 2
+        from SiEPIC.utils.layout import y_splitter_tree
+        tree_depth = 2
+        inst_tree_in, inst_tree_out, cell_tree = y_splitter_tree(cell, tree_depth=tree_depth, y_splitter_cell=cell_y_branch, library="EBeam-SiN", wg_type=wg_type, draw_waveguides=True)
         
-        # Position student design: right 2*radius*1e3, up 250 µm from Y-branch
-        student_x = y_branch_inst.bbox().right + 2 * radius * 1e3
-        student_y = y_branch_inst.bbox().center().y + 250e3  # 250 µm up
+        # Position the tree after the heater
+        tree_x = inst_heater.bbox().right
+        tree_y = inst_heater.pinPoint('opt2').y
+        t = pya.Trans(pya.Trans.R0, tree_x, tree_y)
+        tree_inst = cell.insert(pya.CellInstArray(cell_tree.cell_index(), t))
+        
+        # Connect heater to tree input
+        connect_pins_with_waveguide(inst_heater, 'opt2', inst_tree_in, 'opt_1', waveguide_type=wg_type)
+        
+        # Position student design: right 2*radius*1e3, up 250 µm from tree
+        student_x = tree_inst.bbox().right + 2 * radius * 1e3
+        student_y = tree_inst.bbox().center().y + 250e3  # 250 µm up
         submission_inst = cell.insert(pya.CellInstArray(submission_cell_new.cell_index(), 
                                                        pya.Trans(pya.Trans.R0, student_x, student_y)))
         
-        # Connect Y-branch output to the submission design
-        connect_pins_with_waveguide(y_branch_inst, 'opt2',
+        # Connect first tree output to the submission design
+        connect_pins_with_waveguide(inst_tree_out[0], 'opt2',
                                     submission_inst, 'opt_laser',
                                     waveguide_type=wg_type)
         
@@ -515,8 +565,8 @@ def create_simplified_piclet(topcell, submission_cell, submission_name, filename
             faml_inst = cell.insert(pya.CellInstArray(cell_faml.cell_index(), 
                                                      pya.Trans(pya.Trans.R180, faml_x, faml_y)))
             
-            # Connect the other Y-branch output (opt3) to FaML
-            connect_pins_with_waveguide(y_branch_inst, 'opt3', faml_inst, 'opt1',
+            # Connect the second tree output (opt3) to FaML
+            connect_pins_with_waveguide(inst_tree_out[1], 'opt3', faml_inst, 'opt1',
                                        waveguide_type=wg_type)
             print(f"Created FaML cell on right edge at x={faml_x}")
         else:
@@ -619,7 +669,11 @@ def generate_piclets():
     print(f"Found {len(submissions)} submissions")
     
     # Generate PIClet for each submission
-    for filename, submission_cell, submission_layout in submissions[0:2]:
+    if process_num_submissions == -1:
+        submissions_process = submissions
+    else:
+        submissions_process = submissions[0:process_num_submissions]
+    for filename, submission_cell, submission_layout in submissions_process:
         submission_name = os.path.splitext(filename)[0]
         print(f"Generating PIClet for: {submission_name}")
         
